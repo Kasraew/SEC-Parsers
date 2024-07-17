@@ -3,20 +3,24 @@ import re
 import csv
 from collections import deque
 
-from sec_parsers.style_detection import detect_style_from_string, detect_style_from_element, detect_table, detect_image,detect_table_of_contents, get_all_text, is_paragraph,\
-detect_hidden_element, is_descendant_of_table
-from sec_parsers.xml_helper import get_text, set_background_color, remove_background_color, open_tree,get_text_between_elements,get_elements_between_elements
+from sec_parsers.style_detection import detect_style_from_string, detect_style_from_element, detect_table, detect_image, \
+    detect_table_of_contents, get_all_text, is_paragraph, \
+    detect_hidden_element, is_descendant_of_table
+from sec_parsers.xml_helper import get_text, set_background_color, remove_background_color, open_tree, \
+    get_text_between_elements, get_elements_between_elements
 from sec_parsers.visualization_helper import headers_colors_dict, headers_colors_list
 from sec_parsers.hierarchy import get_hierarchy, get_preceding_elements, find_last_index
 from sec_parsers.cleaning import clean_title, part_pattern
-#TODO add better attributes, and a bunch of other stuff
+
+
+# TODO add better attributes, and a bunch of other stuff
 
 # dictionary parsing_type = ignore is e.g. images that we currently ignore, text is added to previous node
 
 # html attributes, parsing_string, parsing_type
-def recursive_parse(element):
+def recursive_parse_legacy(element):
     """ Recursively parse elements to detect potential headers """
-    
+
     # if element is invisible, skip
     if detect_hidden_element(element):
         return
@@ -56,7 +60,92 @@ def recursive_parse(element):
         else:
             element.attrib['parsing_string'] = parsing_string
 
-    return 
+    return
+
+
+def recursive_parse(element, filing_type, active_compensation_section_tag=None):
+    """ Recursively parse elements to detect the required sections """
+
+    # if element is invisible, skip
+    if detect_hidden_element(element):
+        return active_compensation_section_tag
+
+    # checks for header tags (h2, h3, etc.) and their descendants
+    header_tags = ['h1', 'h2', 'h3']
+    is_header = element.tag.lower() in header_tags
+
+    text = get_text(element).strip().lower()
+    if is_header:
+        # if the header is the "Compensation Discussion and Analysis" section, add all the contents to the compensation section until we reach the next header of the same type
+        if "compensation discussion and analysis" == text or any(
+                "compensation discussion and analysis" == get_text(descendant).strip().lower() for descendant in
+                element.iterdescendants()):
+            element.attrib['parsing_string'] = 'compensation_section;'
+            active_compensation_section_tag = element.tag.lower()
+        else:
+            element.attrib['parsing_string'] = 'header;'
+            if element.tag.lower() == active_compensation_section_tag:
+                active_compensation_section_tag = None
+
+    if detect_table(element):
+        if filing_type == 'DEF 14A' and active_compensation_section_tag is not None:
+            element.attrib['parsing_string'] = 'compensation_section_table;'
+        else:
+            element.attrib['parsing_string'] = 'table;'
+        return active_compensation_section_tag
+    elif detect_image(element):
+        element.attrib['parsing_string'] = 'image;'
+        return active_compensation_section_tag
+
+    text = get_text(element).strip()
+    if text == '':
+        # if the text is empty, recursively parses the child elements
+        for child in element.iterchildren():
+            active_compensation_section_tag = recursive_parse(child, filing_type, active_compensation_section_tag)
+    else:
+        if active_compensation_section_tag is not None:
+            element.attrib['parsing_string'] = 'compensation_section_text;'
+        else:
+            parsing_string = detect_style_from_string(text) + detect_style_from_element(element)
+            element.attrib['parsing_string'] = parsing_string
+
+        # recursively parses the child elements
+        for child in element.iterchildren():
+            active_compensation_section_tag = recursive_parse(child, filing_type, active_compensation_section_tag)
+
+    return active_compensation_section_tag
+
+
+def relative_parsing_def14a(html):
+    """Looks at parsed html from recursive parsing DEF 14A documents and uses relative position to improve parsing."""
+    parsed_elements = deque(html.xpath('//*[@parsing_string]'))
+    processed_elements = set()
+
+    while parsed_elements:
+        parsed_element = parsed_elements.popleft()
+
+        if parsed_element in processed_elements:
+            continue
+
+        parsing_string = parsed_element.get('parsing_string')
+
+        # skipping processing for certain parsing strings
+        if parsing_string in ['table;', 'image;', 'compensation_section;', 'compensation_section_table;']:
+            continue
+
+        children = parsed_element.xpath("child::*")
+        if children:
+            descendants_with_parsing_string = parsed_element.xpath('.//*[@parsing_string]')
+            if descendants_with_parsing_string:
+                parsed_element.attrib.pop('parsing_string')
+            else:
+                text = get_all_text(parsed_element)
+                parsed_element.attrib['parsing_string'] = parsing_string + detect_style_from_string(text)
+
+        processed_elements.add(parsed_element)
+
+    return html
+
 
 # WIP
 def relative_parsing(html):
@@ -66,11 +155,11 @@ def relative_parsing(html):
 
     while parsed_elements:
         parsed_element = parsed_elements.popleft()
-        
+
         # Skip if this element has already been processed
         if parsed_element in processed_elements:
             continue
-     
+
         parsing_string = parsed_element.get('parsing_string')
 
         # skip certain parsing strings WIP
@@ -81,7 +170,7 @@ def relative_parsing(html):
         # Process children
         children = parsed_element.xpath("child::*")
         if children:
-            descendants_with_parsing_string = parsed_element.xpath('.//*[@parsing_string]') # changed WIP
+            descendants_with_parsing_string = parsed_element.xpath('.//*[@parsing_string]')  # changed WIP
             if descendants_with_parsing_string:
                 parsed_element.attrib.pop('parsing_string')
             else:
@@ -118,22 +207,21 @@ def relative_parsing(html):
                     if not elements_between:
                         flag = True
                     # detect text style on parent
-                    else: # WIP
+                    else:  # WIP
                         parent = parsed_element.getparent()
                         text = get_all_text(parent)
                         string_style = detect_style_from_string(text)
-                        if any([string_style == item for item in ['part;','item;','signatures;']]):
+                        if any([string_style == item for item in ['part;', 'item;', 'signatures;']]):
                             parent.attrib['parsing_string'] = string_style + 'parent;'
                             # delete parsing string from children
                             descendants_with_parsing_string = parent.xpath('.//*[@parsing_string]')
                             for descendant in descendants_with_parsing_string:
                                 descendant.attrib.pop('parsing_string')
                                 processed_elements.add(descendant)
-                            
-                            parsed_elements.appendleft(parent)
-  
 
-                    if flag: #  WIP struggles with some cases where whitespace between two elements. figure out how to fix w/o breaking other stuff
+                            parsed_elements.appendleft(parent)
+
+                    if flag:  # WIP struggles with some cases where whitespace between two elements. figure out how to fix w/o breaking other stuff
                         parent = parsed_element.getparent()
                         parent.attrib['parsing_string'] = parsing_string + "parent;"
                         next_element.attrib.pop('parsing_string')
@@ -143,8 +231,8 @@ def relative_parsing(html):
                         parsed_elements.appendleft(parent)  # Add parent to be processed next
                     else:
                         previous_element = parsed_element.getprevious()
-                        if previous_element is not None: 
-                            text = get_text(previous_element).strip() # WIP: may introduce some issues
+                        if previous_element is not None:
+                            text = get_text(previous_element).strip()  # WIP: may introduce some issues
                             if previous_element.get('parsing_string') is None and text != '':
                                 parsed_element.attrib.pop('parsing_string', None)
 
@@ -152,13 +240,14 @@ def relative_parsing(html):
 
     return html
 
+
 def cleanup_parsing(html):
     # reads html and sets attributes
     parsed_elements = html.xpath('//*[@parsing_string]')
     for parsed_element in parsed_elements:
 
-        parsing_string = parsed_element.get('parsing_string')   
-        parsing_string = parsing_string.replace('parent;','')
+        parsing_string = parsed_element.get('parsing_string')
+        parsing_string = parsing_string.replace('parent;', '')
 
         parsing_type = parsing_string
         if 'part;' in parsing_string:
@@ -172,7 +261,7 @@ def cleanup_parsing(html):
         elif any([parsing_string == item for item in ['table']]):
             parsing_type = 'table;'
         # be careful with this, may need to add more conditions
-        elif any([item in parsing_string for item in ['table of contents;','link;','image;','page number;']]):
+        elif any([item in parsing_string for item in ['table of contents;', 'link;', 'image;', 'page number;']]):
             parsing_type = 'ignore;'
         # elif any([item in parsing_string for item in ['font-style:italic;','em','i']]):
         #     text = get_text(parsed_element)
@@ -182,12 +271,31 @@ def cleanup_parsing(html):
         if parsing_type is not None:
             parsed_element.attrib['parsing_type'] = parsing_type
 
+    return html
+
+
+def cleanup_parsing_def14a(html):
+    """Cleanup parsing strings and set final parsing types for DEF-14A documents."""
+    parsed_elements = html.xpath('//*[@parsing_string]')
+    for parsed_element in parsed_elements:
+        parsing_string = parsed_element.get('parsing_string')
+        parsing_string = parsing_string.replace('parent;', '')
+
+        if 'compensation_section;' in parsing_string:
+            parsed_element.attrib['parsing_type'] = 'compensation_section;'
+        elif 'compensation_section_table;' in parsing_string:
+            parsed_element.attrib['parsing_type'] = 'compensation_section_table;'
+        elif 'compensation_section_text;' in parsing_string:
+            parsed_element.attrib['parsing_type'] = 'compensation_section_text;'
+        else:
+            parsed_element.attrib.pop('parsing_string', None)
 
     return html
-        
+
+
 def parse_10k(html):
     # recursive parse for style detection
-    recursive_parse(html)
+    recursive_parse(html, '10-K')
 
     # pruning based on relative locations
     relative_parsing(html)
@@ -195,11 +303,21 @@ def parse_10k(html):
     # standardizing certain elements such as part, item, signatures
     cleanup_parsing(html)
 
+    return html
+
+
+def parse_def14a(html):
+    # Perform parsing steps
+    recursive_parse(html, 'DEF 14A')
+    relative_parsing_def14a(html)
+    cleanup_parsing_def14a(html)
 
     return html
 
+
 # 10q and 10k are the same for now
 parse_10q = parse_10k
+
 
 # TODO: make visualization easier to read at an instance by differentiating colors etc
 def visualize(root):
@@ -212,7 +330,7 @@ def visualize(root):
     # get all unique parsing values
     parsing_values = list(set([element.attrib['parsing_type'] for element in elements]))
     # create a color dict
-    color_dict =dict(zip(parsing_values, headers_colors_list[:len(parsing_values)])) 
+    color_dict = dict(zip(parsing_values, headers_colors_list[:len(parsing_values)]))
     # replace color dict values with values from headers_colors_dict
     for key in headers_colors_dict.keys():
         color_dict[key] = headers_colors_dict[key]
@@ -227,32 +345,49 @@ def visualize(root):
 
     open_tree(root)
 
+
+def print_compensation_node():
+    compensation_node = etree.Element('compensation_discussion_and_analysis',
+                                      title='Compensation Discussion and Analysis')
+    print(compensation_node.text)
+
+
 # Heavily WIP
 # add intro section, which is all text before part i dumped, and add signatures section
 def construct_xml_tree(parsed_html):
     root = etree.Element('root')
 
     # add document node
-    document_node = etree.Element('document', title = 'Document')
+    document_node = etree.Element('document', title='Document')
     root.append(document_node)
-    
+
     # find all parsing elements
     elements = parsed_html.xpath('//*[@parsing_type]')
 
     # find the first part parsing
     # WIP
     parts_elements = parsed_html.xpath("//*[@parsing_type='part;']")
-    first_part_element = [element for element in parts_elements if part_pattern.match(get_all_text(element).strip().lower())][0]
+    if parts_elements:
+        first_part_element = \
+            [element for element in parts_elements if part_pattern.match(get_all_text(element).strip().lower())][0]
+    else:
+        first_part_element = None
 
     # subset elements after first part element
-    elements = elements[elements.index(first_part_element):]
+    if first_part_element:
+        # subset elements after first part element
+        elements = elements[elements.index(first_part_element):]
+    else:
+        # If no part element is found, process all elements
+        first_part_element = elements[0] if elements else None
 
     element_parsing_types = [element.attrib['parsing_type'] for element in elements]
 
     # restrict certain headers
     restricted_headers = ['ignore;']
     # WIP
-    element_parsing_types = [element_parsing_type for element_parsing_type in element_parsing_types if element_parsing_type not in restricted_headers]
+    element_parsing_types = [element_parsing_type for element_parsing_type in element_parsing_types if
+                             element_parsing_type not in restricted_headers]
 
     # get which headers are above which headers
     hierearchy = get_hierarchy(element_parsing_types)
@@ -265,13 +400,13 @@ def construct_xml_tree(parsed_html):
         if count == len(elements) - 1:
             next_element = None
         else:
-            next_element = elements[count+1]
+            next_element = elements[count + 1]
 
         # WIP
         # check if element is a text, if so, add to text of previous node
         element_parsing_type = element.attrib['parsing_type']
         if element_parsing_type == 'table;':
-            node_list[-1].text += get_text_between_elements(parsed_html,element, next_element)
+            node_list[-1].text += get_text_between_elements(parsed_html, element, next_element)
             count += 1
             continue
         # skip element
@@ -281,11 +416,10 @@ def construct_xml_tree(parsed_html):
 
         # construct node
         title = get_all_text(element)
-        text = get_text_between_elements(parsed_html,element, next_element)
+        text = get_text_between_elements(parsed_html, element, next_element)
 
         # TODO replace title in text with empty string
         title = clean_title(title)
-        
 
         if element_parsing_type == 'part;':
             node_class = 'part'
@@ -296,14 +430,14 @@ def construct_xml_tree(parsed_html):
         else:
             node_class = 'company_defined_section'
 
-        node = etree.Element(node_class, title = title, parsing_type = element_parsing_type)
+        node = etree.Element(node_class, title=title, parsing_type=element_parsing_type)
         node.text = text
 
         # should return a list of headers that are above the current header
         rulers = get_preceding_elements(hierearchy, element_parsing_type)
 
         # get the parsing strings of the nodes in the node_list
-        node_parsing_types= [node.attrib['parsing_type'] for node in node_list]
+        node_parsing_types = [node.attrib['parsing_type'] for node in node_list]
 
         # find the last element in the node_parsing_strings which is in rulers
         index = find_last_index(node_parsing_types, rulers)
@@ -314,7 +448,7 @@ def construct_xml_tree(parsed_html):
             document_node.append(node)
             node_list = [node]
         elif len(node_list) == 0:
-            # add node to root 
+            # add node to root
             document_node.append(node)
             # add node to node_list
             node_list = [node]
@@ -325,7 +459,7 @@ def construct_xml_tree(parsed_html):
             node_list.append(node)
         else:
             # subset node_list to index
-            node_list = node_list[:index+1]
+            node_list = node_list[:index + 1]
             # add node to last node in node_list
             node_list[-1].append(node)
             # add node to node_list
@@ -334,17 +468,47 @@ def construct_xml_tree(parsed_html):
         count += 1
 
     # add intro section (insert before first part)
-    introduction_node = etree.Element('introduction', title = 'Introduction')
-    introduction_node.text = get_text_between_elements(parsed_html,start_element=None,end_element=first_part_element)
-    document_node.insert(0,introduction_node)
+    introduction_node = etree.Element('introduction', title='Introduction')
+    introduction_node.text = get_text_between_elements(parsed_html, start_element=None, end_element=first_part_element)
+    document_node.insert(0, introduction_node)
 
     # add signatures section
     # signatures_node = etree.Element('signatures', title = 'Signatures', parsing_type = 'signatures;')
     # signatures_node.text = get_text_between_elements(parsed_html,start_element=signatures,end_element=None)
     # document_node.append(signatures_node)
 
+    return root
+
+
+def construct_xml_tree_def14a(parsed_html):
+    """Construct an XML tree for DEF 14A documents from parsed HTML."""
+
+    root = etree.Element('root')
+
+    document_node = etree.Element('document', title='Document')
+    root.append(document_node)
+
+    elements = parsed_html.xpath(
+        '//*[@parsing_type="compensation_section;" or @parsing_type="compensation_section_table;" or @parsing_type="compensation_section_text;"]')
+    if not elements:
+        return root
+
+    # collect text content from elements
+    content = []
+    for element in elements:
+        content.append(get_all_text(element))
+
+    full_text = ' '.join(content)
+
+    compensation_node = etree.Element('compensation_discussion_and_analysis',
+                                      title='Compensation Discussion and Analysis')
+    compensation_node.text = full_text
+    print(full_text)
+
+    document_node.append(compensation_node)
 
     return root
+
 
 # WIP: convert special checked boxes into True / False, etc
 def parse_metadata(html):
@@ -355,28 +519,31 @@ def parse_metadata(html):
     elements = [element for element in elements if element.attrib['name'].lower().startswith('dei')]
     for element in elements:
         name = element.attrib['name']
-        name = name.replace('dei:','')
+        name = name.replace('dei:', '')
         metadata_dict[name] = get_all_text(element)
     return metadata_dict
+
 
 def detect_filing_type(metadata):
     """WIP"""
     if 'DocumentType' in metadata.keys():
         return metadata['DocumentType']
     else:
-        print('DocumentType not found in metadata. Filing type set to 10K. If this is not correct, please set the filing type manually.')
+        print(
+            'DocumentType not found in metadata. Filing type set to 10K. If this is not correct, please set the filing type manually.')
         return '10-K'
+
 
 # Think about inheritance
 class Filing:
     def __init__(self, html):
         self._setup_html(html)
         self._parse_metadata()
-        self.hierarchy = None # need to implement
+        self.hierarchy = None  # need to implement
         self.xml = None
         self._detect_filing_type()
 
-    def _setup_html(self,html):
+    def _setup_html(self, html):
         # Find the start of the HTML content. This is necessary because the HTML content is not always at the beginning of the file.
         body_start = html.find('<BODY')
         if body_start == -1:
@@ -385,7 +552,7 @@ class Filing:
         if body_start != -1:
             html = html[body_start:]
 
-        parser = etree.HTMLParser(encoding='utf-8',remove_comments=True)
+        parser = etree.HTMLParser(encoding='utf-8', remove_comments=True)
         html = etree.fromstring(html, parser)
 
         self.html = html
@@ -403,6 +570,9 @@ class Filing:
     def _parse_10q(self):
         self.html = parse_10q(self.html)
 
+    def _parse_def14a(self):
+        self.html = parse_def14a(self.html)
+
     def set_filing_type(self, filing_type):
         self.filing_type = filing_type
 
@@ -412,24 +582,35 @@ class Filing:
 
         if self.filing_type == '10-K':
             self._parse_10k()
+            self._to_xml()
         elif self.filing_type == '10-Q':
             self._parse_10q()
+            self._to_xml()
+        elif self.filing_type == 'DEF 14A':
+            self._parse_def14a()
+            self._to_xml_def14a()
         else:
             raise ValueError('Filing type not detected')
-        
-        self._to_xml()
 
     def visualize(self):
         visualize(self.html)
 
+    def visualizeXml(self):
+        visualize(self.xml)
+
+    def printCompensationNode(self):
+        print_compensation_node()
+
     def _to_xml(self):
         self.xml = construct_xml_tree(self.html)
 
+    def _to_xml_def14a(self):
+        self.xml = construct_xml_tree_def14a(self.html)
 
     # functions to interact with xml
 
     # Find #
-    def find_nodes_by_title(self,title):
+    def find_nodes_by_title(self, title):
         title = title.strip().lower()
         if self.xml is None:
             self.to_xml()
@@ -448,49 +629,50 @@ class Filing:
             self.to_xml()
 
         return self.xml.xpath(f"//*[contains(text(), '{text}')]")
-    
-    def fuzzy_find_nodes_by_title(self,title):
+
+    def fuzzy_find_nodes_by_title(self, title):
         # TODO: implement
         pass
+
     # Interact with Node #
 
     # Note, needs refactor, also needs better spacing fix with text.
-    def get_node_text(self,node):
+    def get_node_text(self, node):
         """Gets all text from a node, including title string."""
         text = ''
         # WIP removed this for now. need to add later
-        #text += node.attrib.get('title','') + '\n'
+        # text += node.attrib.get('title','') + '\n'
 
         node_text = node.text
         if node_text is not None:
             text += node.text + '\n'
-            
+
         for child in node:
             text += self.get_node_text(child)
-        
+
         return text
-    
+
     # Interact with tree #
 
     # TODO: user friendly - e.g. if parsed not called call parse
-    def get_tree(self,node=None, level=0):
+    def get_tree(self, node=None, level=0):
         if node is None:
             node = self.xml
         tree_string = node.tag
         for child in node:
             tree_string += '\n' + '|-' * level + self.get_tree(child, level + 1)
         return tree_string
-    
-    def get_title_tree(self,node=None,level=0,attribute='title'):
+
+    def get_title_tree(self, node=None, level=0, attribute='title'):
         if node is None:
             node = self.xml
-            
-        tree_atrib = node.attrib.get(attribute,'')
+
+        tree_atrib = node.attrib.get(attribute, '')
         for child in node:
-            tree_atrib += '\n' + '|-' * level + self.get_title_tree(child, level + 1,attribute)
+            tree_atrib += '\n' + '|-' * level + self.get_title_tree(child, level + 1, attribute)
 
         return tree_atrib
-    
+
     # Save to file #
     def save_xml(self, filename):
         if self.xml is None:
@@ -499,9 +681,8 @@ class Filing:
         with open(filename, 'wb') as f:
             f.write(etree.tostring(self.xml))
 
-            
     def save_csv(self, filename):
-        def get_rows(node,path):
+        def get_rows(node, path):
             path = path + "/" + node.attrib.get('title')
 
             row_list = []
@@ -511,14 +692,14 @@ class Filing:
             row['text'] = self.get_node_text(node)
             row_list.append(row)
             for child in node:
-                row_list.extend(get_rows(child,path))
+                row_list.extend(get_rows(child, path))
 
             return row_list
-        
+
         row_list = []
         for child in self.xml.getchildren():
-            row_list.extend(get_rows(child,''))
-        
+            row_list.extend(get_rows(child, ''))
+
         keys = row_list[0].keys()
 
         with open(filename, 'w', newline='', encoding='utf-8') as output_file:
@@ -529,5 +710,3 @@ class Filing:
     # TODO: implement
     def save_dta(self, filename):
         pass
-
-        
